@@ -7,7 +7,6 @@ from typing import List, Dict, Optional, Union
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-from openai import OpenAI
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 import nltk
 from sentence_transformers import SentenceTransformer
@@ -21,24 +20,55 @@ from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
 
 # Download required NLTK data
+nltk.data.path.append('/share/home/cli/code/memory/nltk_data')
 try:
     nltk.data.find('tokenizers/punkt')
-    nltk.data.find('wordnet')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('wordnet')
+    nltk.data.find('corpora/wordnet')
+    print("NLTK resources found locally.")
+except LookupError as e:
+    print(f"Missing NLTK resource: {e}")
+    print("Offline mode: skip nltk.download()")
 
+DEFAULT_EMBEDDING_MODEL_PATH = "/share/home/cli/code/models/all-MiniLM-L6-v2"
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer(DEFAULT_EMBEDDING_MODEL_PATH)
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
 
+print("1111")
+
+
+def safe_json_loads(text, default=None):
+    if default is None:
+        default = {}
+
+    try:
+        cleaned = str(text).strip()
+
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[len("```json"):].strip()
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[len("```"):].strip()
+
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
+
+        return json.loads(cleaned)
+
+    except Exception:
+        return default
+    
 class advancedMemAgent:
     def __init__(self, model, backend, retrieve_k, temperature_c5, sglang_host="http://localhost", sglang_port=30000):
         self.memory_system = AgenticMemorySystem(
-            model_name='all-MiniLM-L6-v2',
+            model_name=DEFAULT_EMBEDDING_MODEL_PATH,
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
@@ -125,27 +155,15 @@ class advancedMemAgent:
         return response
 
     def answer_question(self, question: str, category: int, answer: str) -> str:
-        """Generate answer for a question given the conversation context."""
         keywords = self.generate_query_llm(question)
-        # if category == 3:
-        #     raw_context = self.retrieve_memory(keywords,k=10)
-        #     # context = self.retrieve_memory_llm(raw_context, keywords)
-        # else:
-        raw_context = self.retrieve_memory(keywords,k=self.retrieve_k)
+        raw_context = self.retrieve_memory(keywords, k=self.retrieve_k)
         context = raw_context
-        # print("context:", context)
-        # context = self.retrieve_memory_llm(raw_context, question)
-        # context = raw_context
-        assert category in [1,2,3,4,5]
-        user_prompt = f"""Context:
-                {context}
 
-                Question: {question}
+        assert category in [1, 2, 3, 4, 5]
 
-                Answer the question based only on the information provided in the context above."""
         temperature = 0.7
-        if category == 5: # adversial question, follow the initial paper.
-            answer_tmp = list()
+        if category == 5:
+            answer_tmp = []
             if random.random() < 0.5:
                 answer_tmp.append('Not mentioned in the conversation')
                 answer_tmp.append(answer)
@@ -153,47 +171,53 @@ class advancedMemAgent:
                 answer_tmp.append(answer)
                 answer_tmp.append('Not mentioned in the conversation')
             user_prompt = f"""
-                            Based on the context: {context}, answer the following question. {question} 
-                            
-                            Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}  Short answer:
-                            """
+    Based on the context: {context}, answer the following question. {question}
+
+    Select the correct answer: {answer_tmp[0]} or {answer_tmp[1]}
+    Return ONLY a valid JSON object: {{"answer": "..."}}
+    """
             temperature = self.temperature_c5
         elif category == 2:
             user_prompt = f"""
-                            Based on the context: {context}, answer the following question. Use DATE of CONVERSATION to answer with an approximate date.
-                            Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.   
+    Based on the context: {context}, answer the following question.
+    Use DATE of CONVERSATION to answer with an approximate date.
+    Please generate the shortest possible answer, using words from the conversation where possible, and avoid using any subjects.
 
-                            Question: {question} Short answer:
-                            """
-        elif category == 3:
-            user_prompt = f"""
-                            Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
-
-                            Question: {question} Short answer:
-                            """
+    Question: {question}
+    Return ONLY a valid JSON object: {{"answer": "..."}}
+    """
         else:
-            user_prompt = f"""Based on the context: {context}, write an answer in the form of a short phrase for the following question. Answer with exact words from the context whenever possible.
+            user_prompt = f"""
+    Based on the context: {context}, write an answer in the form of a short phrase for the following question.
+    Answer with exact words from the context whenever possible.
 
-                            Question: {question} Short answer:
-                            """
-        response = self.memory_system.llm_controller.llm.get_completion(
-            user_prompt,response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "answer": {
-                                    "type": "string",
-                                }
-                            },
-                            "required": ["answer"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }},temperature=temperature
+    Question: {question}
+    Return ONLY a valid JSON object: {{"answer": "..."}}
+    """
+
+        raw_response = self.memory_system.llm_controller.llm.get_completion(
+            user_prompt,
+            response_format={"type": "json_schema", "json_schema": {
+                "name": "response",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"}
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }},
+            temperature=temperature
         )
-        # print(response)
-        return response,user_prompt,raw_context
+
+        parsed = safe_json_loads(raw_response, {"answer": ""})
+        prediction = parsed.get("answer", "")
+
+        return prediction, user_prompt, raw_context
+
+print("1111")
 
 def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     """Set up logging configuration."""
@@ -214,7 +238,11 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     
     return logger
 
-def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "sglang", temperature_c5: float = 0.5, retrieve_k: int = 10, sglang_host: str = "http://localhost", sglang_port: int = 30000):
+def sanitize_model_name(model: str) -> str:
+    return model.replace(os.sep, "_").replace("/", "_").replace(" ", "_")
+
+
+def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "local", temperature_c5: float = 0.5, retrieve_k: int = 10, sglang_host: str = "http://localhost", sglang_port: int = 30000):
     """Evaluate the agent on the LoComo dataset.
     
     Args:
@@ -225,7 +253,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     """
     # Generate automatic log filename with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    log_filename = f"eval_ours_{model}_{backend}_ratio{ratio}_{timestamp}.log"
+    safe_model_name = sanitize_model_name(model)
+    log_filename = f"eval_ours_{safe_model_name}_{backend}_ratio{ratio}_{timestamp}.log"
     log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
     
     # Create logs directory if it doesn't exist
@@ -254,7 +283,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     # Evaluate each sample
     i = 0
     error_num = 0
-    memories_dir = os.path.join(os.path.dirname(__file__), "cached_memories_advanced_{}_{}".format(backend, model))
+    model_cache_name = sanitize_model_name(model)
+    memories_dir = os.path.join(os.path.dirname(__file__), "cached_memories_advanced_{}_{}".format(backend, model_cache_name))
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1,2,3,4,5]
     for sample_idx, sample in enumerate(samples):
@@ -288,7 +318,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 agent.memory_system.retriever = agent.memory_system.retriever.load(retriever_cache_file,retriever_cache_embeddings_file)
             else:
                 print(f"No retriever cache found at {retriever_cache_file}, loading from memory")
-                agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(cached_memories, 'all-MiniLM-L6-v2')
+                agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(cached_memories, DEFAULT_EMBEDDING_MODEL_PATH)
             print(agent.memory_system.retriever.corpus)
             logger.info(f"Successfully loaded {len(cached_memories)} memories")
             # except Exception as e:
@@ -322,13 +352,44 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 category_counts[qa.category] += 1
                 
                 # Generate prediction
-                prediction, user_prompt,raw_context = agent.answer_question(qa.question,qa.category,qa.final_answer)
-                try:
-                    prediction = json.loads(prediction)["answer"]
-                except:
-                    prediction = prediction
-                    logger.info(f"Failed to parse prediction as JSON: {prediction}")
+            prediction, user_prompt, raw_context = agent.answer_question(
+                qa.question, qa.category, qa.final_answer
+            )
+            
+            raw_prediction = prediction
+
+            try:
+                cleaned = str(prediction).strip()
+
+                # 去掉 markdown 代码块
+                if cleaned.startswith("```json"):
+                    cleaned = cleaned[len("```json"):].strip()
+                elif cleaned.startswith("```"):
+                    cleaned = cleaned[len("```"):].strip()
+
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3].strip()
+
+                # 如果前后有杂质，只截取最外层 JSON
+                start = cleaned.find("{")
+                end = cleaned.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    cleaned = cleaned[start:end + 1]
+
+                parsed = json.loads(cleaned)
+
+                if isinstance(parsed, dict) and "answer" in parsed:
+                    prediction = parsed["answer"]
+                else:
+                    prediction = raw_prediction
+                    logger.info(f"Parsed JSON does not contain 'answer': {repr(parsed)}")
                     error_num += 1
+
+            except Exception as e:
+                prediction = raw_prediction
+                logger.info(f"Failed to parse prediction as JSON: {repr(raw_prediction)}")
+                logger.info(f"JSON parse exception: {e}")
+                error_num += 1                
                 # Log results
                 logger.info(f"\nQuestion {total_questions}: {qa.question}")
                 logger.info(f"Prediction: {prediction}")
@@ -404,14 +465,16 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate text-only agent on LoComo dataset")
     parser.add_argument("--dataset", type=str, default="data/locomo10.json",
                       help="Path to the dataset file")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini",
-                      help="OpenAI model to use")
+    parser.add_argument("--model", type=str, default=os.getenv("QWEN_MODEL_PATH", "./models/Qwen2.5-3B-Instruct"),
+                      help="Model name or local filesystem path for the LLM")
+    parser.add_argument("--model_path", type=str, default=None,
+                      help="Optional local filesystem path for Qwen2.5-3B-Instruct; overrides --model when set")
     parser.add_argument("--output", type=str, default=None,
                       help="Path to save evaluation results")
     parser.add_argument("--ratio", type=float, default=1.0,
                       help="Ratio of dataset to evaluate (0.0 to 1.0)")
-    parser.add_argument("--backend", type=str, default="openai",
-                      help="Backend to use (openai, ollama, or sglang)")
+    parser.add_argument("--backend", type=str, default="sglang",
+                      help="Backend to use (local, openai, ollama, or sglang)")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                       help="Temperature for the model")
     parser.add_argument("--retrieve_k", type=int, default=10,
@@ -432,7 +495,9 @@ def main():
     else:
         output_path = None
     
-    evaluate_dataset(dataset_path, args.model, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k, args.sglang_host, args.sglang_port)
+    model_name = args.model_path or args.model
+
+    evaluate_dataset(dataset_path, model_name, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k, args.sglang_host, args.sglang_port)
 
 if __name__ == "__main__":
     main()
