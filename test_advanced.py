@@ -66,20 +66,40 @@ def safe_json_loads(text, default=None):
         return default
     
 class advancedMemAgent:
-    def __init__(self, model, backend, retrieve_k, temperature_c5, sglang_host="http://localhost", sglang_port=30000):
+    def __init__(
+        self,
+        model,
+        backend,
+        retrieve_k,
+        temperature_c5,
+        sglang_host="http://localhost",
+        sglang_port=30000,
+        local_device_map="auto",
+        local_gpu_ids=None,
+        local_max_memory_per_gpu=None,
+        local_cpu_offload_memory=None,
+    ):
         self.memory_system = AgenticMemorySystem(
             model_name=DEFAULT_EMBEDDING_MODEL_PATH,
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
-            sglang_port=sglang_port
+            sglang_port=sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
         )
         self.retriever_llm = LLMController(
             backend=backend, 
             model=model, 
             api_key=None, 
             sglang_host=sglang_host, 
-            sglang_port=sglang_port
+            sglang_port=sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
         )
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
@@ -242,7 +262,27 @@ def sanitize_model_name(model: str) -> str:
     return model.replace(os.sep, "_").replace("/", "_").replace(" ", "_")
 
 
-def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "local", temperature_c5: float = 0.5, retrieve_k: int = 10, sglang_host: str = "http://localhost", sglang_port: int = 30000):
+def parse_gpu_ids(gpu_ids: Optional[str]) -> Optional[List[int]]:
+    if gpu_ids is None or gpu_ids.strip() == "":
+        return None
+    return [int(gpu_id.strip()) for gpu_id in gpu_ids.split(",") if gpu_id.strip()]
+
+
+def evaluate_dataset(
+    dataset_path: str,
+    model: str,
+    output_path: Optional[str] = None,
+    ratio: float = 1.0,
+    backend: str = "local",
+    temperature_c5: float = 0.5,
+    retrieve_k: int = 10,
+    sglang_host: str = "http://localhost",
+    sglang_port: int = 30000,
+    local_device_map: str = "auto",
+    local_gpu_ids: Optional[List[int]] = None,
+    local_max_memory_per_gpu: Optional[str] = None,
+    local_cpu_offload_memory: Optional[str] = None,
+):
     """Evaluate the agent on the LoComo dataset.
     
     Args:
@@ -288,7 +328,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1,2,3,4,5]
     for sample_idx, sample in enumerate(samples):
-        agent = advancedMemAgent(model, backend, retrieve_k, temperature_c5, sglang_host, sglang_port)
+        agent = advancedMemAgent(
+            model,
+            backend,
+            retrieve_k,
+            temperature_c5,
+            sglang_host,
+            sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
+        )
         # Create memory cache filename based on sample and session indices
         memory_cache_file = os.path.join(
             memories_dir,
@@ -465,7 +516,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate text-only agent on LoComo dataset")
     parser.add_argument("--dataset", type=str, default="data/locomo10.json",
                       help="Path to the dataset file")
-    parser.add_argument("--model", type=str, default=os.getenv("QWEN_MODEL_PATH", "./models/Qwen2.5-3B-Instruct"),
+    parser.add_argument("--model", type=str, default=os.getenv("QWEN_MODEL_PATH", "Qwen/Qwen2.5-3B-Instruct"),
                       help="Model name or local filesystem path for the LLM")
     parser.add_argument("--model_path", type=str, default=None,
                       help="Optional local filesystem path for Qwen2.5-3B-Instruct; overrides --model when set")
@@ -473,8 +524,16 @@ def main():
                       help="Path to save evaluation results")
     parser.add_argument("--ratio", type=float, default=1.0,
                       help="Ratio of dataset to evaluate (0.0 to 1.0)")
-    parser.add_argument("--backend", type=str, default="sglang",
+    parser.add_argument("--backend", type=str, default="local",
                       help="Backend to use (local, openai, ollama, or sglang)")
+    parser.add_argument("--device_map", type=str, default="auto",
+                      help="Transformers device_map for local backend: auto, balanced, balanced_low_0, sequential, or cpu")
+    parser.add_argument("--gpu_ids", type=str, default=None,
+                      help="Comma-separated GPU ids for local backend, e.g. 0,1")
+    parser.add_argument("--max_memory_per_gpu", type=str, default=None,
+                      help="Optional per-GPU memory limit for local backend, e.g. 20GiB")
+    parser.add_argument("--cpu_offload_memory", type=str, default=None,
+                      help="Optional CPU RAM budget for offload, e.g. 64GiB")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                       help="Temperature for the model")
     parser.add_argument("--retrieve_k", type=int, default=10,
@@ -496,8 +555,23 @@ def main():
         output_path = None
     
     model_name = args.model_path or args.model
+    local_gpu_ids = parse_gpu_ids(args.gpu_ids)
 
-    evaluate_dataset(dataset_path, model_name, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k, args.sglang_host, args.sglang_port)
+    evaluate_dataset(
+        dataset_path,
+        model_name,
+        output_path,
+        args.ratio,
+        args.backend,
+        args.temperature_c5,
+        args.retrieve_k,
+        args.sglang_host,
+        args.sglang_port,
+        args.device_map,
+        local_gpu_ids,
+        args.max_memory_per_gpu,
+        args.cpu_offload_memory,
+    )
 
 if __name__ == "__main__":
     main()
