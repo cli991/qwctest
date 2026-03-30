@@ -1,5 +1,5 @@
 from ast import Str
-from typing import List, Dict, Optional, Literal, Any, Union
+from typing import List, Dict, Optional, Literal, Any, Union, Tuple
 import json
 from datetime import datetime
 import uuid
@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 from abc import ABC, abstractmethod
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from nltk.tokenize import word_tokenize
 import pickle
 from pathlib import Path
@@ -17,6 +17,8 @@ from litellm import completion
 import requests
 import json as json_lib
 import time
+import re
+import torch
 
 def simple_tokenize(text):
     return word_tokenize(text)
@@ -26,6 +28,175 @@ class BaseLLMController(ABC):
     def get_completion(self, prompt: str) -> str:
         """Get completion from LLM"""
         pass
+
+def _generate_empty_value(schema_type: str, schema_items: dict = None) -> Any:
+    if schema_type == "array":
+        return []
+    if schema_type == "string":
+        return ""
+    if schema_type == "object":
+        return {}
+    if schema_type in {"number", "integer"}:
+        return 0
+    if schema_type == "boolean":
+        return False
+    return None
+
+
+def _generate_empty_response(response_format: dict) -> dict:
+    if "json_schema" not in response_format:
+        return {}
+
+    schema = response_format["json_schema"]["schema"]
+    result = {}
+
+    if "properties" in schema:
+        for prop_name, prop_schema in schema["properties"].items():
+            result[prop_name] = _generate_empty_value(prop_schema["type"], prop_schema.get("items"))
+
+    return result
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return None
+
+
+class LocalTransformersController(BaseLLMController):
+    _shared_models: Dict[str, Any] = {}
+
+    def __init__(
+        self,
+        model: str = "Qwen/Qwen2.5-3B-Instruct",
+        device_map: str = "auto",
+        gpu_ids: Optional[List[int]] = None,
+        max_memory_per_gpu: Optional[str] = None,
+        cpu_offload_memory: Optional[str] = None,
+    ):
+        self.model_name = model
+        self.device_map = device_map
+        self.gpu_ids = gpu_ids or []
+        cache_key: Tuple[Any, ...] = (
+            model,
+            device_map,
+            tuple(self.gpu_ids),
+            max_memory_per_gpu,
+            cpu_offload_memory,
+        )
+
+        if cache_key not in self._shared_models:
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+            model_kwargs = {
+                "trust_remote_code": True,
+            }
+            if device_map == "cpu":
+                model_kwargs["torch_dtype"] = torch.float32
+                model_kwargs["device_map"] = "cpu"
+            elif torch.cuda.is_available():
+                model_kwargs["torch_dtype"] = torch.float16
+                model_kwargs["device_map"] = device_map
+                max_memory = self._build_max_memory(max_memory_per_gpu, cpu_offload_memory)
+                if max_memory:
+                    model_kwargs["max_memory"] = max_memory
+            else:
+                model_kwargs["torch_dtype"] = torch.float32
+
+            loaded_model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            self._shared_models[cache_key] = (tokenizer, loaded_model)
+
+        self.tokenizer, self.model = self._shared_models[cache_key]
+
+    def _build_max_memory(
+        self,
+        max_memory_per_gpu: Optional[str],
+        cpu_offload_memory: Optional[str],
+    ) -> Optional[Dict[Union[int, str], str]]:
+        if not self.gpu_ids and not cpu_offload_memory:
+            return None
+
+        max_memory: Dict[Union[int, str], str] = {}
+        if self.gpu_ids:
+            for gpu_id in self.gpu_ids:
+                if max_memory_per_gpu:
+                    max_memory[gpu_id] = max_memory_per_gpu
+                else:
+                    total_memory_bytes = torch.cuda.get_device_properties(gpu_id).total_memory
+                    total_memory_gib = max(1, int(total_memory_bytes / (1024 ** 3) * 0.95))
+                    max_memory[gpu_id] = f"{total_memory_gib}GiB"
+        if cpu_offload_memory:
+            max_memory["cpu"] = cpu_offload_memory
+        return max_memory or None
+
+    def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
+        schema = response_format.get("json_schema", {}).get("schema", {})
+        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You must answer with a single valid JSON object that matches the provided schema. "
+                    "Do not add explanations or markdown fences.\nSchema:\n" + schema_text
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            model_inputs = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+        else:
+            serialized_prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            model_inputs = self.tokenizer(serialized_prompt, return_tensors="pt").input_ids
+
+        model_device = next(self.model.parameters()).device
+        model_inputs = model_inputs.to(model_device)
+        pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        generation_kwargs = {
+            "max_new_tokens": 768,
+            "pad_token_id": pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if temperature and temperature > 0:
+            generation_kwargs.update({
+                "do_sample": True,
+                "temperature": temperature,
+                "top_p": 0.9,
+            })
+        else:
+            generation_kwargs["do_sample"] = False
+
+        try:
+            with torch.no_grad():
+                generated = self.model.generate(model_inputs, **generation_kwargs)
+            generated_tokens = generated[0][model_inputs.shape[-1]:]
+            response_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            json_payload = _extract_json_object(response_text)
+            if json_payload is None:
+                raise ValueError(f"Could not find JSON object in response: {response_text}")
+            json.loads(json_payload)
+            return json_payload
+        except Exception as e:
+            print(f"Local transformers completion error: {e}")
+            return json.dumps(_generate_empty_response(response_format), ensure_ascii=False)
 
 class OpenAIController(BaseLLMController):
     def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
@@ -58,33 +229,6 @@ class OllamaController(BaseLLMController):
         from ollama import chat
         self.model = model
     
-    def _generate_empty_value(self, schema_type: str, schema_items: dict = None) -> Any:
-        if schema_type == "array":
-            return []
-        elif schema_type == "string":
-            return ""
-        elif schema_type == "object":
-            return {}
-        elif schema_type == "number":
-            return 0
-        elif schema_type == "boolean":
-            return False
-        return None
-
-    def _generate_empty_response(self, response_format: dict) -> dict:
-        if "json_schema" not in response_format:
-            return {}
-            
-        schema = response_format["json_schema"]["schema"]
-        result = {}
-        
-        if "properties" in schema:
-            for prop_name, prop_schema in schema["properties"].items():
-                result[prop_name] = self._generate_empty_value(prop_schema["type"], 
-                                                            prop_schema.get("items"))
-        
-        return result
-
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
         try:
             response = completion(
@@ -97,7 +241,7 @@ class OllamaController(BaseLLMController):
             )
             return response.choices[0].message.content
         except Exception as e:
-            empty_response = self._generate_empty_response(response_format)
+            empty_response = _generate_empty_response(response_format)
             return json.dumps(empty_response)
 
 class SGLangController(BaseLLMController):
@@ -107,33 +251,6 @@ class SGLangController(BaseLLMController):
         self.sglang_port = sglang_port
         self.base_url = f"{sglang_host}:{sglang_port}"
     
-    def _generate_empty_value(self, schema_type: str, schema_items: dict = None) -> Any:
-        if schema_type == "array":
-            return []
-        elif schema_type == "string":
-            return ""
-        elif schema_type == "object":
-            return {}
-        elif schema_type == "number" or schema_type == "integer":
-            return 0
-        elif schema_type == "boolean":
-            return False
-        return None
-
-    def _generate_empty_response(self, response_format: dict) -> dict:
-        if "json_schema" not in response_format:
-            return {}
-            
-        schema = response_format["json_schema"]["schema"]
-        result = {}
-        
-        if "properties" in schema:
-            for prop_name, prop_schema in schema["properties"].items():
-                result[prop_name] = self._generate_empty_value(prop_schema["type"], 
-                                                            prop_schema.get("items"))
-        
-        return result
-
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
         try:
             # Extract JSON schema from response_format and convert to string format
@@ -169,7 +286,7 @@ class SGLangController(BaseLLMController):
                 
         except Exception as e:
             print(f"SGLang completion error: {e}")
-            empty_response = self._generate_empty_response(response_format)
+            empty_response = _generate_empty_response(response_format)
             return json.dumps(empty_response)
 
 class LiteLLMController(BaseLLMController):
@@ -179,33 +296,6 @@ class LiteLLMController(BaseLLMController):
         self.api_base = api_base
         self.api_key = api_key or "EMPTY"
     
-    def _generate_empty_value(self, schema_type: str, schema_items: dict = None) -> Any:
-        if schema_type == "array":
-            return []
-        elif schema_type == "string":
-            return ""
-        elif schema_type == "object":
-            return {}
-        elif schema_type == "number":
-            return 0
-        elif schema_type == "boolean":
-            return False
-        return None
-
-    def _generate_empty_response(self, response_format: dict) -> dict:
-        if "json_schema" not in response_format:
-            return {}
-            
-        schema = response_format["json_schema"]["schema"]
-        result = {}
-        
-        if "properties" in schema:
-            for prop_name, prop_schema in schema["properties"].items():
-                result[prop_name] = self._generate_empty_value(prop_schema["type"], 
-                                                            prop_schema.get("items"))
-        
-        return result
-
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
         try:
             # Prepare completion arguments
@@ -230,18 +320,22 @@ class LiteLLMController(BaseLLMController):
             
         except Exception as e:
             print(f"LiteLLM completion error: {e}")
-            empty_response = self._generate_empty_response(response_format)
+            empty_response = _generate_empty_response(response_format)
             return json.dumps(empty_response)
 
 class LLMController:
     """LLM-based controller for memory metadata generation"""
     def __init__(self, 
-                 backend: Literal["openai", "ollama", "sglang"] = "sglang",
+                 backend: Literal["openai", "ollama", "sglang", "local"] = "sglang",
                  model: str = "gpt-4", 
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+                 sglang_port: int = 30000,
+                 local_device_map: str = "auto",
+                 local_gpu_ids: Optional[List[int]] = None,
+                 local_max_memory_per_gpu: Optional[str] = None,
+                 local_cpu_offload_memory: Optional[str] = None):
         if backend == "openai":
             self.llm = OpenAIController(model, api_key)
         elif backend == "ollama":
@@ -255,8 +349,16 @@ class LLMController:
         elif backend == "sglang":
             # Direct SGLang API calls (better performance, no proxy)
             self.llm = SGLangController(model, sglang_host, sglang_port)
+        elif backend == "local":
+            self.llm = LocalTransformersController(
+                model,
+                device_map=local_device_map,
+                gpu_ids=local_gpu_ids,
+                max_memory_per_gpu=local_max_memory_per_gpu,
+                cpu_offload_memory=local_cpu_offload_memory,
+            )
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', or 'sglang'")
+            raise ValueError("Backend must be 'openai', 'ollama', 'sglang', or 'local'")
 
 class MemoryNote:
     """Basic memory unit with metadata"""
@@ -376,10 +478,10 @@ class MemoryNote:
             #         end_idx = response_cleaned.rfind('}')
             #         if end_idx != -1:
             #             response_cleaned = response_cleaned[:end_idx+1]
-            try:        
+            try:
                 response = re.sub(r'^```json\s*|\s*```$', '', response, flags=re.MULTILINE).strip()
                 analysis = json.loads(response)
-            except:
+            except json.JSONDecodeError as e:
                 print(f"JSON parsing error in analyze_content: {e}")
                 print(f"Raw response: {response}")
                 analysis = {
@@ -673,10 +775,25 @@ class AgenticMemorySystem:
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+                 sglang_port: int = 30000,
+                 local_device_map: str = "auto",
+                 local_gpu_ids: Optional[List[int]] = None,
+                 local_max_memory_per_gpu: Optional[str] = None,
+                 local_cpu_offload_memory: Optional[str] = None):
         self.memories = {}  # id -> MemoryNote
         self.retriever = SimpleEmbeddingRetriever(model_name)
-        self.llm_controller = LLMController(llm_backend, llm_model, api_key, api_base, sglang_host, sglang_port)
+        self.llm_controller = LLMController(
+            llm_backend,
+            llm_model,
+            api_key,
+            api_base,
+            sglang_host,
+            sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
+        )
         self.evolution_system_prompt = '''
                                 You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
                                 Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.

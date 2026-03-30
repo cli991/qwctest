@@ -7,7 +7,6 @@ from typing import List, Dict, Optional, Union
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
-from openai import OpenAI
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 import nltk
 from sentence_transformers import SentenceTransformer
@@ -36,20 +35,40 @@ except Exception as e:
     sentence_model = None
 
 class advancedMemAgent:
-    def __init__(self, model, backend, retrieve_k, temperature_c5, sglang_host="http://localhost", sglang_port=30000):
+    def __init__(
+        self,
+        model,
+        backend,
+        retrieve_k,
+        temperature_c5,
+        sglang_host="http://localhost",
+        sglang_port=30000,
+        local_device_map="auto",
+        local_gpu_ids=None,
+        local_max_memory_per_gpu=None,
+        local_cpu_offload_memory=None,
+    ):
         self.memory_system = AgenticMemorySystem(
             model_name='all-MiniLM-L6-v2',
             llm_backend=backend,
             llm_model=model,
             sglang_host=sglang_host,
-            sglang_port=sglang_port
+            sglang_port=sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
         )
         self.retriever_llm = LLMController(
             backend=backend, 
             model=model, 
             api_key=None, 
             sglang_host=sglang_host, 
-            sglang_port=sglang_port
+            sglang_port=sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
         )
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
@@ -214,7 +233,31 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     
     return logger
 
-def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "sglang", temperature_c5: float = 0.5, retrieve_k: int = 10, sglang_host: str = "http://localhost", sglang_port: int = 30000):
+def sanitize_model_name(model: str) -> str:
+    return model.replace(os.sep, "_").replace("/", "_").replace(" ", "_")
+
+
+def parse_gpu_ids(gpu_ids: Optional[str]) -> Optional[List[int]]:
+    if gpu_ids is None or gpu_ids.strip() == "":
+        return None
+    return [int(gpu_id.strip()) for gpu_id in gpu_ids.split(",") if gpu_id.strip()]
+
+
+def evaluate_dataset(
+    dataset_path: str,
+    model: str,
+    output_path: Optional[str] = None,
+    ratio: float = 1.0,
+    backend: str = "local",
+    temperature_c5: float = 0.5,
+    retrieve_k: int = 10,
+    sglang_host: str = "http://localhost",
+    sglang_port: int = 30000,
+    local_device_map: str = "auto",
+    local_gpu_ids: Optional[List[int]] = None,
+    local_max_memory_per_gpu: Optional[str] = None,
+    local_cpu_offload_memory: Optional[str] = None,
+):
     """Evaluate the agent on the LoComo dataset.
     
     Args:
@@ -225,7 +268,8 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     """
     # Generate automatic log filename with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    log_filename = f"eval_ours_{model}_{backend}_ratio{ratio}_{timestamp}.log"
+    safe_model_name = sanitize_model_name(model)
+    log_filename = f"eval_ours_{safe_model_name}_{backend}_ratio{ratio}_{timestamp}.log"
     log_path = os.path.join(os.path.dirname(__file__), "logs", log_filename)
     
     # Create logs directory if it doesn't exist
@@ -254,11 +298,23 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     # Evaluate each sample
     i = 0
     error_num = 0
-    memories_dir = os.path.join(os.path.dirname(__file__), "cached_memories_advanced_{}_{}".format(backend, model))
+    model_cache_name = sanitize_model_name(model)
+    memories_dir = os.path.join(os.path.dirname(__file__), "cached_memories_advanced_{}_{}".format(backend, model_cache_name))
     os.makedirs(memories_dir, exist_ok=True)
     allow_categories = [1,2,3,4,5]
     for sample_idx, sample in enumerate(samples):
-        agent = advancedMemAgent(model, backend, retrieve_k, temperature_c5, sglang_host, sglang_port)
+        agent = advancedMemAgent(
+            model,
+            backend,
+            retrieve_k,
+            temperature_c5,
+            sglang_host,
+            sglang_port,
+            local_device_map=local_device_map,
+            local_gpu_ids=local_gpu_ids,
+            local_max_memory_per_gpu=local_max_memory_per_gpu,
+            local_cpu_offload_memory=local_cpu_offload_memory,
+        )
         # Create memory cache filename based on sample and session indices
         memory_cache_file = os.path.join(
             memories_dir,
@@ -404,14 +460,24 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate text-only agent on LoComo dataset")
     parser.add_argument("--dataset", type=str, default="data/locomo10.json",
                       help="Path to the dataset file")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini",
-                      help="OpenAI model to use")
+    parser.add_argument("--model", type=str, default=os.getenv("QWEN_MODEL_PATH", "Qwen/Qwen2.5-3B-Instruct"),
+                      help="Model name or local filesystem path for the LLM")
+    parser.add_argument("--model_path", type=str, default=None,
+                      help="Optional local filesystem path for Qwen2.5-3B-Instruct; overrides --model when set")
     parser.add_argument("--output", type=str, default=None,
                       help="Path to save evaluation results")
     parser.add_argument("--ratio", type=float, default=1.0,
                       help="Ratio of dataset to evaluate (0.0 to 1.0)")
-    parser.add_argument("--backend", type=str, default="openai",
-                      help="Backend to use (openai, ollama, or sglang)")
+    parser.add_argument("--backend", type=str, default="local",
+                      help="Backend to use (local, openai, ollama, or sglang)")
+    parser.add_argument("--device_map", type=str, default="auto",
+                      help="Transformers device_map for local backend: auto, balanced, balanced_low_0, sequential, or cpu")
+    parser.add_argument("--gpu_ids", type=str, default=None,
+                      help="Comma-separated GPU ids for local backend, e.g. 0,1")
+    parser.add_argument("--max_memory_per_gpu", type=str, default=None,
+                      help="Optional per-GPU memory limit for local backend, e.g. 20GiB")
+    parser.add_argument("--cpu_offload_memory", type=str, default=None,
+                      help="Optional CPU RAM budget for offload, e.g. 64GiB")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                       help="Temperature for the model")
     parser.add_argument("--retrieve_k", type=int, default=10,
@@ -432,7 +498,24 @@ def main():
     else:
         output_path = None
     
-    evaluate_dataset(dataset_path, args.model, output_path, args.ratio, args.backend, args.temperature_c5, args.retrieve_k, args.sglang_host, args.sglang_port)
+    model_name = args.model_path or args.model
+    local_gpu_ids = parse_gpu_ids(args.gpu_ids)
+
+    evaluate_dataset(
+        dataset_path,
+        model_name,
+        output_path,
+        args.ratio,
+        args.backend,
+        args.temperature_c5,
+        args.retrieve_k,
+        args.sglang_host,
+        args.sglang_port,
+        args.device_map,
+        local_gpu_ids,
+        args.max_memory_per_gpu,
+        args.cpu_offload_memory,
+    )
 
 if __name__ == "__main__":
     main()
